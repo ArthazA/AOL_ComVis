@@ -2,144 +2,189 @@ import streamlit as st
 import numpy as np
 import cv2
 import joblib
-from skimage.feature import hog, local_binary_pattern
-from PIL import Image
+import os
+from skimage.feature import hog, graycomatrix, graycoprops
 
-# Load model + scaler
-svm = joblib.load("svm_model.pkl")
-scaler = joblib.load("scaler.pkl")
 
-# vread() same as before
-def vread(basepath):
-    spr_path = basepath + ".spr"
-    sdt_path = basepath + ".sdt"
+bundle = joblib.load("volcano_detector.pkl")
+model = bundle["model"]
+scaler = bundle["scaler"]
+CHIP_SIZE = bundle["chip_size"]
 
-    with open(spr_path, "r") as f:
-        ndim = int(f.readline().strip())
-        nc = int(f.readline().strip())
-        _ = f.readline()
-        _ = f.readline()
-        nr = int(f.readline().strip())
-        _ = f.readline()
-        _ = f.readline()
-        dtype_code = int(f.readline().strip())
 
-    dtype = {0: np.uint8, 2: np.int32, 3: np.float32, 5: np.float64}[dtype_code]
+def vread_bytes(sdt_bytes, spr_bytes):
+    lines = spr_bytes.decode("utf-8").splitlines()
+    idx = 0
 
-    with open(sdt_path, "rb") as f:
-        data = np.frombuffer(f.read(), dtype=dtype)
+    ndim = int(lines[idx].strip()); idx += 1
+    if ndim != 2:
+        raise ValueError("Only 2D images supported")
+
+    nc = int(lines[idx].strip()); idx += 1
+    idx += 2 
+    nr = int(lines[idx].strip()); idx += 1
+    idx += 2 
+
+    dtype_code = int(lines[idx].strip())
+    dtype_map = {
+        0: np.uint8,
+        2: np.int32,
+        3: np.float32,
+        5: np.float64
+    }
+
+    if dtype_code not in dtype_map:
+        raise ValueError(f"Unknown dtype code {dtype_code}")
+
+    dtype = dtype_map[dtype_code]
+
+    data = np.frombuffer(sdt_bytes, dtype=dtype)
+    data = data[:nr * nc]
 
     return data.reshape((nr, nc))
 
-def extract_features(img):
-    img = cv2.resize(img, (64, 64))
+def load_lxyv(path):
+    points = []
+    with open(path, "r") as f:
+        for line in f:
+            _, x, y, value = line.strip().split()
+            points.append((int(float(x)), int(float(y)), float(value)))
+    return points
 
-    fd, _ = hog(img, orientations=8, pixels_per_cell=(8,8),
-                cells_per_block=(2,2), visualize=True, block_norm='L2')
+def preprocess(img):
+    img = cv2.medianBlur(img, 3)
+    clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(32, 32))
+    return clahe.apply(img.astype(np.uint8))
 
-    lbp = local_binary_pattern(img, P=8, R=1, method="uniform")
-    hist, _ = np.histogram(lbp, bins=10, range=(0,10), density=True)
+def extract_chip(img, cx, cy, size):
+    h, w = img.shape
+    half = size // 2
 
-    return np.hstack([fd, hist])
+    x1 = max(0, cx - half)
+    y1 = max(0, cy - half)
+    x2 = min(w, cx + half)
+    y2 = min(h, cy + half)
+
+    chip = img[y1:y2, x1:x2]
+
+    return cv2.copyMakeBorder(
+        chip,
+        top=max(0, size - chip.shape[0]),
+        bottom=0,
+        left=max(0, size - chip.shape[1]),
+        right=0,
+        borderType=cv2.BORDER_REFLECT
+    )
 
 
-st.title("Venus Volcano Detection (SVM + HOG + LBP)")
+def extract_features(chip):
+    chip = cv2.resize(chip, (32, 32))
 
-uploaded = st.file_uploader("Upload SAR .sdt file", type=["sdt"])
+    hog_feat = hog(
+        chip,
+        orientations=6,
+        pixels_per_cell=(8, 8),
+        cells_per_block=(2, 2),
+        block_norm="L2",
+        visualize=False
+    )
 
-if uploaded:
-    basepath = uploaded.name[:-4]
-    
-    with open(basepath + ".sdt", "wb") as f:
-        f.write(uploaded.getbuffer())
+    glcm = graycomatrix(
+        chip,
+        distances=[1, 2],
+        angles=[0, np.pi/4, np.pi/2, 3*np.pi/4],
+        levels=256,
+        symmetric=True,
+        normed=True
+    )
 
-    st.info("Upload the matching .spr file")
-    uploaded_spr = st.file_uploader("Upload matching .spr", type=["spr"])
+    glcm_feats = []
+    for prop in ("contrast", "homogeneity", "energy", "correlation"):
+        glcm_feats.extend(graycoprops(glcm, prop).flatten())
 
-    if uploaded_spr:
-        with open(basepath + ".spr", "wb") as f:
-            f.write(uploaded_spr.getbuffer())
+    return np.hstack([hog_feat, glcm_feats])
 
-        img = vread(basepath)
-        img_disp = img.copy()
 
-        win = 64
-        step = 32
 
-        boxes = []
-        scores = []
+# UI
 
-        heatmap = np.zeros((
-            (img.shape[0] - win) // step + 1,
-            (img.shape[1] - win) // step + 1
-        ), dtype=np.float32)
+st.title("🌋 Venus Volcano Detector (FOA-based)")
 
-        heat_y = 0
-        for y in range(0, img.shape[0] - win, step):
-            heat_x = 0
-            for x in range(0, img.shape[1] - win, step):
+sdt_file = st.file_uploader("Upload .sdt file", type=["sdt"])
+spr_file = st.file_uploader("Upload matching .spr file", type=["spr"])
 
-                crop = img[y:y+win, x:x+win]
-                feat = extract_features(crop)
-                feat = scaler.transform([feat])
+if sdt_file and spr_file:
 
-                prob = svm.predict_proba(feat)[0][1]
-                heatmap[heat_y, heat_x] = prob
+    img_id = sdt_file.name.replace(".sdt", "")
 
-                # detection threshold
-                if prob > 0.5:
-                    boxes.append((x, y, prob))
+    img = vread_bytes(sdt_file.getvalue(), spr_file.getvalue())
+    img = preprocess(img)
 
-                heat_x += 1
-            heat_y += 1
+    foa_path = f"./package/FOA/exp_C/exp_C1/tst/{img_id}.lxyv" # img79 until img134
+    if not os.path.exists(foa_path):
+        st.error(f"No FOA test file found for {img_id}")
+        st.stop()
 
-        heatmap_norm = (heatmap * 255).astype(np.uint8)
-        heatmap_resized = cv2.resize(
-            heatmap_norm,
-            (img.shape[1], img.shape[0]),
-            interpolation=cv2.INTER_LINEAR
+    foa_points = load_lxyv(foa_path)
+
+    heatmap = np.zeros(img.shape, dtype=np.float32)
+    detections = []
+
+    for x, y, _ in foa_points:
+        chip = extract_chip(img, x, y, CHIP_SIZE)
+        feat = extract_features(chip)
+        feat = scaler.transform([feat])
+
+        prob = model.predict_proba(feat)[0, 1]
+        detections.append((x, y, prob))
+        heatmap[y, x] = max(heatmap[y, x], prob)
+
+    heatmap = cv2.GaussianBlur(heatmap, (0, 0), sigmaX=15)
+    heatmap_norm = (heatmap / heatmap.max() * 255).astype(np.uint8)
+    heatmap_color = cv2.applyColorMap(heatmap_norm, cv2.COLORMAP_JET)
+
+    img_vis = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    img_vis = cv2.cvtColor(img_vis, cv2.COLOR_GRAY2BGR)
+
+    half = CHIP_SIZE // 2
+    for x, y, p in detections:
+        if p < 0.5:
+            continue
+
+        if p >= 0.85:
+            color = (0, 255, 0) # Shrek
+        elif p >= 0.7:
+            color = (0, 255, 255) # Piss Yella
+        else:
+            color = (0, 0, 255) # . Red
+
+        cv2.rectangle(
+            img_vis,
+            (x - half, y - half),
+            (x + half, y + half),
+            color,
+            2
         )
-        heatmap_color = cv2.applyColorMap(heatmap_resized, cv2.COLORMAP_JET)
-    
-
-        # for (x, y, p) in boxes:
-        #     color = (0, int(255*p), 0)
-        #     cv2.rectangle(img_disp, (x,y), (x+win, y+win), color, 2)
-
-        # st.image(img_disp, caption="Detected volcanoes", use_column_width=True)
-
-
-        img_norm = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-        img_disp_color = cv2.cvtColor(img_norm, cv2.COLOR_GRAY2BGR)
-
-        for (x, y, p) in boxes:
-            if p > 0.85:
-                color = (0, 255, 0)
-                label = "High" # Green
-            elif p > 0.70:
-                color = (0, 255, 255)
-                label = "Med" # Yella
-            else:
-                color = (0, 0, 255)
-                label = "Low" # Red
-
-            cv2.rectangle(img_disp_color, (x, y), (x+win, y+win), color, 2)
-            
-            text = f"{p:.2f}"
-            cv2.putText(img_disp_color, text, (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
-
-        img_rgb = cv2.cvtColor(img_disp_color, cv2.COLOR_BGR2RGB)
-        
-        st.image(img_rgb, caption="Detected volcanoes (Green = High, Yellow = Med, Red = Low)", use_column_width=True)
-        
-
-        overlay = cv2.addWeighted(
-            cv2.cvtColor(img.astype(np.uint8), cv2.COLOR_GRAY2BGR),
-            0.6,
-            heatmap_color,
+        cv2.putText(
+            img_vis,
+            f"{p:.2f}",
+            (x - half, y - half - 4),
+            cv2.FONT_HERSHEY_SIMPLEX,
             0.4,
-            0
+            color,
+            1
         )
 
-        st.subheader("Volcano Confidence Heatmap")
-        st.image(overlay, use_column_width=True)
+    st.subheader("Detected Volcanoes")
+    st.image(cv2.cvtColor(img_vis, cv2.COLOR_BGR2RGB), use_column_width=True)
+
+    overlay = cv2.addWeighted(
+        cv2.cvtColor(img_vis, cv2.COLOR_BGR2RGB),
+        0.6,
+        heatmap_color,
+        0.4,
+        0
+    )
+
+    st.subheader("Probability Heatmap")
+    st.image(overlay, use_column_width=True)
